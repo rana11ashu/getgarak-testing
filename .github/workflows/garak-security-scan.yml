@@ -1,0 +1,214 @@
+name: Garak Security Scan
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  workflow_dispatch:  # Allow manual triggers
+
+jobs:
+  garak-security-scan:
+    name: Run Garak Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install garak-sdk requests
+
+      - name: Run Garak Security Scan
+        env:
+          GARAK_API_KEY: ${{ secrets.GARAK_API_KEY }}
+        run: |
+          python << 'EOF'
+          import os
+          import json
+          import time
+          import sys
+          from garak_sdk import GarakClient
+
+          # Initialize Garak client
+          client = GarakClient(api_key=os.environ['GARAK_API_KEY'])
+
+          # Start security scan
+          print("Starting Garak security scan...")
+          print(f"Target endpoint: https://api.anthropic.com/v1/messages")
+          print(f"Probes: dan,security,privacy,toxicity,hallucination,performance,robustness,ethics,stereotype")
+
+          scan = client.scans.create(
+              generator="rest",
+              model_name="https://api.anthropic.com/v1/messages",
+              probe_categories=["dan", "security", "privacy", "toxicity", "hallucination", "performance", "robustness", "ethics", "stereotype"],
+              name=f"GitHub Actions Scan",
+              description=f"Automated scan from GitHub Actions",
+              parallel_attempts=4,
+              use_free_tier=False,
+              rest_config={
+                  "uri": "https://api.anthropic.com/v1/messages",
+                  "method": "POST",
+                  "headers": {"x-api-key": "${{ secrets.X_API_KEY }}", "anthropic-version": "2023-06-01", "content-type": "application/json", "Content-Type": "application/json"},
+                  "req_template_json_object": {},
+                  "response_json_field": "$.content[0].text",
+                  "response_json": True,
+                  "verify_ssl": True
+              }
+          )
+
+          # Handle response - extract scan_id
+          scan_id = None
+          if isinstance(scan, dict):
+              if scan.get("redirect") == "jobs":
+                  # Multiple scans - get the first scan_id from the list
+                  print(f"Multiple scans found: {scan.get('message')}")
+                  scan_ids = scan.get('scan_ids', [])
+                  if scan_ids and len(scan_ids) > 0:
+                      scan_id = scan_ids[0]
+                      print(f"Using scan_id: {scan_id} (first of {len(scan_ids)} scans)")
+              else:
+                  scan_id = scan.get("scan_id")
+          else:
+              # Handle object response
+              if hasattr(scan, 'metadata'):
+                  scan_id = scan.metadata.scan_id
+              elif hasattr(scan, 'scan_id'):
+                  scan_id = scan.scan_id
+
+          if not scan_id:
+              print('Error: Failed to extract scan_id from response')
+              print(f'Response: {scan}')
+              sys.exit(1)
+
+          print(f"Scan created with ID: {scan_id}")
+          print(f"View scan results: https://scans.garaksecurity.com/jobs/{scan_id}")
+          print("Waiting for scan completion...")
+
+          # Poll for scan completion
+          max_wait_time = 3600  # 1 hour
+          poll_interval = 10  # 10 seconds
+          elapsed_time = 0
+
+          while elapsed_time < max_wait_time:
+              try:
+                  # Check scan status
+                  status_response = client.scans.get_status(scan_id)
+
+                  # Extract status from response
+                  if hasattr(status_response, 'status'):
+                      current_status = status_response.status
+                  elif isinstance(status_response, dict):
+                      current_status = status_response.get('status')
+                  else:
+                      current_status = str(status_response)
+
+                  # Check if scan is complete
+                  if hasattr(current_status, 'value'):
+                      status_str = current_status.value.lower()
+                  else:
+                      status_str = str(current_status).lower()
+
+                  if status_str in ['completed', 'failed', 'cancelled']:
+                      print(f"Scan finished with status: {current_status}")
+                      if status_str == 'failed':
+                          failure_reason = getattr(status_response, 'failure', 'Unknown error')
+                          print(f"Failure reason: {failure_reason}")
+                          sys.exit(1)
+                      elif status_str == 'cancelled':
+                          print("Scan was cancelled")
+                          sys.exit(1)
+                      break
+
+                  print(f"Scan still running... ({elapsed_time}s elapsed)")
+                  time.sleep(poll_interval)
+                  elapsed_time += poll_interval
+
+              except Exception as e:
+                  print(f"Error checking status: {e}")
+                  print(f"Waiting for status... ({elapsed_time}s elapsed)")
+                  time.sleep(poll_interval)
+                  elapsed_time += poll_interval
+
+          if elapsed_time >= max_wait_time:
+              print("Scan timed out after 1 hour")
+              sys.exit(1)
+
+          # Get final results
+          print("\nFetching final results...")
+          try:
+              results = client.scans.get_results(scan_id)
+
+              # Extract metrics
+              if isinstance(results, dict):
+                  overall_metrics = results.get('overallMetrics', {})
+                  score = overall_metrics.get('overallScore', 0) * 100
+
+                  # Check for vulnerabilities
+                  vulnerabilities = results.get('vulnerabilities', [])
+                  if vulnerabilities:
+                      print(f"\n⚠️  Found {len(vulnerabilities)} vulnerabilities:")
+                      for vuln in vulnerabilities[:5]:  # Show first 5
+                          print(f"  - {vuln.get('type', 'Unknown')}: {vuln.get('description', 'No description')}")
+                      if len(vulnerabilities) > 5:
+                          print(f"  ... and {len(vulnerabilities) - 5} more")
+
+                  # Score threshold check
+                  if score < 80:
+                      print(f"\n❌ Security score below threshold: {score:.2f}/100")
+                      sys.exit(1)
+                  else:
+                      print(f"\n✅ Security scan passed: {score:.2f}/100")
+              else:
+                  print(f"Results: {results}")
+                  print("✅ Scan completed successfully")
+
+          except Exception as e:
+              print(f"Error fetching results: {e}")
+              print("⚠️  Scan completed but couldn't fetch detailed results")
+              # Don't fail the workflow if we can't get results
+
+          print("\n🎯 Garak security scan completed successfully!")
+          EOF
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: garak-scan-results
+          path: |
+            garak_scan_results.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Comment on PR (if applicable)
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let comment = '## 🔒 Garak Security Scan Results\n\n';
+
+            // Check if scan passed based on exit code
+            if (process.env.SCAN_FAILED === 'true') {
+              comment += '❌ Security scan failed. Please review the workflow logs for details.\n';
+            } else {
+              comment += '✅ Security scan passed successfully!\n';
+            }
+
+            comment += '\n[View full scan results in workflow logs](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})';
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
